@@ -1,0 +1,11 @@
+# Datasets
+data/*.csv
+ml/*.csv
+
+# Trained models
+*.pkl
+*.joblib
+
+# Generated metadata/results
+ml/*.json
+ml/*.txt
