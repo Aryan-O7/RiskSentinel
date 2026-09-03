@@ -1,39 +1,44 @@
 # RiskSentinel
 
-### AI-Powered Payment Fraud Detection & Risk Scoring
-
-RiskSentinel is an AI-powered payment risk management system designed to identify suspicious payment transactions, assign a risk score, explain the major risk factors, and assist human reviewers in making better decisions.
+AI-powered payment fraud detection and risk scoring.
 
 ## Problem
 
-Digital payment systems need to detect potentially fraudulent transactions while minimizing false positives that can negatively affect legitimate customers.
+Merchants need to identify suspicious payments while
+reducing false positives against legitimate customers.
 
-## Objective
+## Architecture
 
-RiskSentinel aims to:
+Transaction
+→ FastAPI
+→ XGBoost
+→ Risk Engine
+→ AI Investigation
+→ Human Review
+→ PostgreSQL / SQLite
 
-- Detect suspicious payment transactions
-- Generate a transaction risk score from 0–100
-- Classify transactions as Low, Medium, or High risk
-- Explain the factors contributing to a high-risk decision
-- Assist human reviewers with recommended actions
-- Measure model performance using precision, recall, F1-score, and false-positive cost
+## Features
 
-## Planned Approach
+- Transaction risk scoring
+- Fraud detection
+- Risk-factor explanations
+- AI investigation
+- Human review workflow
+- Transaction history
+- Business-cost analysis
 
-```text
-Payment Transaction
-        ↓
-Feature Extraction
-        ↓
-Risk Detection Model
-        ↓
-Risk Score
-        ↓
-Low / Medium / High
-        ↓
-AI Investigation
-        ↓
-Explanation & Recommendation
-        ↓
-Human Review
+## Evaluation
+
+Precision: 0.3610
+Recall: 0.7352
+F1: 0.4842
+ROC-AUC: 0.8288
+
+## Tech Stack
+
+Python
+FastAPI
+XGBoost
+SQLite (Easily Swappable to PostgreSQL)
+React
+OpenAI API

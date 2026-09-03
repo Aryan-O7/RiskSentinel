@@ -1,68 +1,52 @@
 import sys
 import os
+import logging
 from pathlib import Path
 
-from fastapi import FastAPI
+# Fix import path
+BACKEND_DIR = Path(__file__).resolve().parent
+sys.path.insert(0, str(BACKEND_DIR))
+
+from typing import Optional
+from datetime import datetime
+from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+
+from database import Base, engine, get_db
+from models import Transaction
+from schemas import TransactionRequest
+from services.risk_service import assess_risk
+from services.ai_investigator import investigate_transaction
 
 
-# --------------------------------------------------
-# Add project root to Python path
-# --------------------------------------------------
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("risksentinel")
 
-PROJECT_ROOT = str(Path(__file__).resolve().parent.parent)
-if PROJECT_ROOT not in sys.path:
-    sys.path.append(PROJECT_ROOT)
-
-from ml.risk_engine import assess_transaction
-
-
-# --------------------------------------------------
-# Create FastAPI app
-# --------------------------------------------------
+# Create database tables
+Base.metadata.create_all(bind=engine)
 
 app = FastAPI(
     title="RiskSentinel API",
-    description="AI-powered payment fraud risk detection API",
+    description="API for the RiskSentinel fraud detection system.",
     version="1.0.0"
 )
 
-
-# --------------------------------------------------
 # CORS
-# --------------------------------------------------
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "http://localhost:5173"
+)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[FRONTEND_URL],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
-
-
-# --------------------------------------------------
-# Request schema
-# --------------------------------------------------
-
-class TransactionRequest(BaseModel):
-    amount: float = Field(gt=0)
-    account_age_days: int = Field(ge=1)
-    transactions_last_24h: int = Field(ge=0)
-    avg_transaction_amount: float = Field(gt=0)
-    failed_attempts: int = Field(ge=0)
-    device_changed: int = Field(ge=0, le=1)
-    location_changed: int = Field(ge=0, le=1)
-    ip_risk_score: float = Field(ge=0, le=1)
-    previous_chargebacks: int = Field(ge=0)
-    transaction_hour: int = Field(ge=0, le=23)
-    payment_method: str
-
-
-# --------------------------------------------------
-# Health check
-# --------------------------------------------------
 
 @app.get("/")
 def root():
@@ -71,32 +55,273 @@ def root():
         "status": "running"
     }
 
-
 @app.get("/health")
-def health():
-    return {
-        "status": "healthy"
-    }
-
-
-# --------------------------------------------------
-# Risk assessment
-# --------------------------------------------------
+def health(db: Session = Depends(get_db)):
+    try:
+        db.execute(text("SELECT 1"))
+        return {
+            "status": "healthy",
+            "database": "connected"
+        }
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "status": "unhealthy",
+                "database": "unavailable"
+            }
+        )
 
 @app.post("/api/v1/risk/assess")
-def assess_risk(transaction: TransactionRequest):
+def assess_transaction(
+    transaction: TransactionRequest,
+    db: Session = Depends(get_db)
+):
     try:
-        result = assess_transaction(
-            transaction.model_dump()
+        transaction_data = transaction.model_dump()
+        result = assess_risk(transaction_data)
+
+        db_transaction = Transaction(
+            amount=transaction.amount,
+            account_age_days=transaction.account_age_days,
+            transactions_last_24h=transaction.transactions_last_24h,
+            avg_transaction_amount=transaction.avg_transaction_amount,
+            failed_attempts=transaction.failed_attempts,
+            device_changed=transaction.device_changed,
+            location_changed=transaction.location_changed,
+            ip_risk_score=transaction.ip_risk_score,
+            previous_chargebacks=transaction.previous_chargebacks,
+            transaction_hour=transaction.transaction_hour,
+            payment_method=transaction.payment_method,
+
+            risk_score=result["risk_score"],
+            risk_level=result["risk_level"],
+            recommended_action=result["recommended_action"],
+
+            risk_reasons="||".join(
+                result["reasons"]
+            )
+        )
+
+        db.add(db_transaction)
+        db.commit()
+        db.refresh(db_transaction)
+        
+        logger.info(
+            "Risk assessment created: transaction_id=%s",
+            db_transaction.id
         )
 
         return {
             "success": True,
+            "transaction_id": db_transaction.id,
             "data": result
         }
 
     except Exception:
-        return {
-            "success": False,
-            "error": "Risk assessment failed"
+        db.rollback()
+        logger.exception("Risk assessment failed")
+        raise HTTPException(
+            status_code=500,
+            detail="Risk assessment failed"
+        )
+
+
+# --------------------------------------------------
+# Get transaction history
+# --------------------------------------------------
+@app.get("/api/v1/transactions")
+def get_transactions(
+    limit: int = 50,
+    risk_level: Optional[str] = None,
+    db: Session = Depends(get_db)
+):
+    query = db.query(Transaction)
+
+    if risk_level:
+        query = query.filter(
+            Transaction.risk_level == risk_level.upper()
+        )
+
+    transactions = (
+        query
+        .order_by(Transaction.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+
+    return {
+        "success": True,
+        "count": len(transactions),
+        "data": [
+            {
+                "id": t.id,
+                "amount": t.amount,
+                "payment_method": t.payment_method,
+                "risk_score": t.risk_score,
+                "risk_level": t.risk_level,
+                "recommended_action": t.recommended_action,
+                "risk_reasons": (
+                    t.risk_reasons.split("||")
+                    if t.risk_reasons
+                    else []
+                ),
+                "review_decision": t.review_decision,
+                "reviewed_at": t.reviewed_at,
+                "created_at": t.created_at
+            }
+            for t in transactions
+        ]
+    }
+
+# --------------------------------------------------
+# Get a single transaction
+# --------------------------------------------------
+@app.get("/api/v1/transactions/{transaction_id}")
+def get_transaction(
+    transaction_id: int,
+    db: Session = Depends(get_db)
+):
+    transaction = (
+        db.query(Transaction)
+        .filter(Transaction.id == transaction_id)
+        .first()
+    )
+
+    if not transaction:
+        raise HTTPException(
+            status_code=404,
+            detail="Transaction not found"
+        )
+
+    return {
+        "success": True,
+        "data": {
+            "id": transaction.id,
+            "amount": transaction.amount,
+            "account_age_days": transaction.account_age_days,
+            "transactions_last_24h": transaction.transactions_last_24h,
+            "avg_transaction_amount": transaction.avg_transaction_amount,
+            "failed_attempts": transaction.failed_attempts,
+            "device_changed": transaction.device_changed,
+            "location_changed": transaction.location_changed,
+            "ip_risk_score": transaction.ip_risk_score,
+            "previous_chargebacks": transaction.previous_chargebacks,
+            "transaction_hour": transaction.transaction_hour,
+            "payment_method": transaction.payment_method,
+            "risk_score": transaction.risk_score,
+            "risk_level": transaction.risk_level,
+            "recommended_action": transaction.recommended_action,
+            "risk_reasons": (
+                transaction.risk_reasons.split("||")
+                if transaction.risk_reasons
+                else []
+            ),
+            "review_decision": transaction.review_decision,
+            "reviewed_at": transaction.reviewed_at,
+            "created_at": transaction.created_at
         }
+    }
+
+
+# --------------------------------------------------
+# Submit human review decision
+# --------------------------------------------------
+@app.post("/api/v1/transactions/{transaction_id}/review")
+def review_transaction(
+    transaction_id: int,
+    decision: str,
+    db: Session = Depends(get_db)
+):
+    allowed_decisions = {"ALLOW", "REVIEW", "BLOCK"}
+    decision = decision.upper()
+
+    if decision not in allowed_decisions:
+        raise HTTPException(
+            status_code=400,
+            detail="Decision must be ALLOW, REVIEW, or BLOCK"
+        )
+
+    transaction = (
+        db.query(Transaction)
+        .filter(Transaction.id == transaction_id)
+        .first()
+    )
+
+    if not transaction:
+        raise HTTPException(
+            status_code=404,
+            detail="Transaction not found"
+        )
+
+    transaction.review_decision = decision
+    transaction.reviewed_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(transaction)
+
+    return {
+        "success": True,
+        "message": "Review decision saved",
+        "data": {
+            "transaction_id": transaction.id,
+            "review_decision": transaction.review_decision,
+            "reviewed_at": transaction.reviewed_at
+        }
+    }
+
+
+@app.post("/api/v1/transactions/{transaction_id}/investigate")
+def investigate_saved_transaction(
+    transaction_id: int,
+    db: Session = Depends(get_db)
+):
+    transaction = (
+        db.query(Transaction)
+        .filter(Transaction.id == transaction_id)
+        .first()
+    )
+
+    if not transaction:
+        raise HTTPException(
+            status_code=404,
+            detail="Transaction not found"
+        )
+
+    reasons = (
+        transaction.risk_reasons.split("||")
+        if transaction.risk_reasons
+        else []
+    )
+
+    transaction_data = {
+        "amount": transaction.amount,
+        "account_age_days": transaction.account_age_days,
+        "transactions_last_24h": transaction.transactions_last_24h,
+        "avg_transaction_amount": transaction.avg_transaction_amount,
+        "failed_attempts": transaction.failed_attempts,
+        "device_changed": transaction.device_changed,
+        "location_changed": transaction.location_changed,
+        "ip_risk_score": transaction.ip_risk_score,
+        "previous_chargebacks": transaction.previous_chargebacks,
+        "transaction_hour": transaction.transaction_hour,
+        "payment_method": transaction.payment_method
+    }
+
+    risk_result = {
+        "risk_score": transaction.risk_score,
+        "risk_level": transaction.risk_level,
+        "recommended_action": transaction.recommended_action,
+        "reasons": reasons
+    }
+
+    investigation = investigate_transaction(
+        transaction_data,
+        risk_result
+    )
+
+    return {
+        "success": True,
+        "transaction_id": transaction.id,
+        "investigation": investigation
+    }
