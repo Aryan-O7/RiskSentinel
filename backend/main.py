@@ -557,8 +557,9 @@ def create_new_transaction(
             recommended_action=
                 result["recommended_action"],
 
-            risk_reasons=
-                "||".join(result["reasons"])
+            risk_reasons="||".join(
+                result["risk_reasons"]
+            )
         )
 
         db.add(new_transaction)
@@ -587,14 +588,16 @@ def create_new_transaction(
                 "recommended_action":
                     new_transaction.recommended_action,
                 "reasons":
-                    result["reasons"]
+                    result["risk_reasons"]
             }
         }
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         db.rollback()
         raise HTTPException(
             status_code=500,
-            detail="Unable to create transaction"
+            detail=f"Unable to create transaction: {str(e)}"
         )
 
 @app.get(
