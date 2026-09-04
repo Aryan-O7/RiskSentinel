@@ -1,22 +1,20 @@
+import json
 import os
+
 import joblib
 import pandas as pd
-
-from sklearn.model_selection import train_test_split
 from sklearn.metrics import (
+    confusion_matrix,
+    f1_score,
     precision_score,
     recall_score,
-    f1_score,
     roc_auc_score,
-    confusion_matrix,
-    classification_report
 )
 
 
-# --------------------------------------------------
+# -----------------------------
 # Paths
-# --------------------------------------------------
-
+# -----------------------------
 BASE_DIR = os.path.dirname(
     os.path.dirname(__file__)
 )
@@ -24,172 +22,290 @@ BASE_DIR = os.path.dirname(
 DATA_PATH = os.path.join(
     BASE_DIR,
     "data",
-    "transactions.csv"
+    "transactions.csv",
 )
 
 MODEL_PATH = os.path.join(
-    os.path.dirname(__file__),
+    BASE_DIR,
+    "ml",
     "saved_models",
-    "xgboost_risk_model.pkl"
+    "xgboost_risk_model.pkl",
+)
+
+METRICS_PATH = os.path.join(
+    BASE_DIR,
+    "ml",
+    "saved_models",
+    "metrics.json",
 )
 
 
-# --------------------------------------------------
-# Load dataset
-# --------------------------------------------------
+# -----------------------------
+# Production threshold
+# -----------------------------
+# Use the threshold selected from
+# threshold_analysis_v2.py.
+THRESHOLD = 0.30
 
+
+# Business costs
+COST_PER_FALSE_POSITIVE = 500
+COST_PER_FALSE_NEGATIVE = 2000
+
+
+# -----------------------------
+# Load dataset
+# -----------------------------
 df = pd.read_csv(DATA_PATH)
 
-X = df.drop(
-    columns=[
-        "transaction_id",
-        "fraud_label"
-    ]
+df["timestamp"] = pd.to_datetime(
+    df["timestamp"]
 )
 
-y = df["fraud_label"]
+df = df.sort_values(
+    "timestamp"
+).reset_index(drop=True)
 
 
-# --------------------------------------------------
-# Final held-out test set
-# --------------------------------------------------
+# -----------------------------
+# Features
+# -----------------------------
+feature_columns = [
+    "amount",
+    "account_age_days",
+    "transactions_last_24h",
+    "avg_transaction_amount",
+    "failed_attempts",
+    "device_changed",
+    "location_changed",
+    "ip_risk_score",
+    "previous_chargebacks",
+    "transaction_hour",
+    "payment_method",
+    "previous_transaction_count",
+    "historical_average_amount",
+    "amount_vs_historical_average",
+    "previous_high_risk_count",
+    "previous_blocked_count",
+    "transactions_last_1h",
+]
 
-_, X_test, _, y_test = train_test_split(
-    X,
-    y,
-    test_size=0.20,
-    random_state=42,
-    stratify=y
+
+# -----------------------------
+# Test split
+# -----------------------------
+split_index = int(
+    len(df) * 0.80
+)
+
+test_df = df.iloc[
+    split_index:
+].copy()
+
+X_test = test_df[
+    feature_columns
+]
+
+y_test = test_df[
+    "fraud_label"
+]
+
+
+# -----------------------------
+# Load model
+# -----------------------------
+package = joblib.load(
+    MODEL_PATH
+)
+
+model = package["model"]
+preprocessor = package["preprocessor"]
+
+
+X_test_processed = (
+    preprocessor.transform(X_test)
 )
 
 
-# --------------------------------------------------
-# Load trained model
-# --------------------------------------------------
-
-model = joblib.load(MODEL_PATH)
-
-
-# --------------------------------------------------
+# -----------------------------
 # Predictions
-# --------------------------------------------------
+# -----------------------------
+y_probability = (
+    model.predict_proba(
+        X_test_processed
+    )[:, 1]
+)
 
-probabilities = model.predict_proba(
-    X_test
-)[:, 1]
-
-# Set THRESHOLD to 0.50 for evaluation
-THRESHOLD = 0.50
-
-predictions = (
-    probabilities >= THRESHOLD
+y_pred = (
+    y_probability >= THRESHOLD
 ).astype(int)
 
 
-# --------------------------------------------------
+# -----------------------------
 # Metrics
-# --------------------------------------------------
-
+# -----------------------------
 precision = precision_score(
     y_test,
-    predictions,
-    zero_division=0
+    y_pred,
+    zero_division=0,
 )
 
 recall = recall_score(
     y_test,
-    predictions,
-    zero_division=0
+    y_pred,
+    zero_division=0,
 )
 
 f1 = f1_score(
     y_test,
-    predictions,
-    zero_division=0
+    y_pred,
+    zero_division=0,
 )
 
 roc_auc = roc_auc_score(
     y_test,
-    probabilities
+    y_probability,
 )
-
-
-# --------------------------------------------------
-# Confusion matrix
-# --------------------------------------------------
 
 tn, fp, fn, tp = confusion_matrix(
     y_test,
-    predictions
+    y_pred,
 ).ravel()
 
 
-# --------------------------------------------------
-# Business cost assumptions
-# --------------------------------------------------
-
-COST_PER_FALSE_POSITIVE = 500
-COST_PER_FALSE_NEGATIVE = 2000
-
-fp_cost = (
+false_positive_cost = (
     fp * COST_PER_FALSE_POSITIVE
 )
 
-fn_cost = (
+false_negative_cost = (
     fn * COST_PER_FALSE_NEGATIVE
 )
 
-total_cost = fp_cost + fn_cost
+total_cost = (
+    false_positive_cost
+    + false_negative_cost
+)
 
 
-# --------------------------------------------------
-# Print results
-# --------------------------------------------------
+# -----------------------------
+# Save metrics
+# -----------------------------
+metrics = {
+    "model": "XGBoost",
+    "model_version": "history-aware-v1",
+    "threshold": THRESHOLD,
+    "test_samples": len(test_df),
 
-print("\n" + "=" * 70)
-print("RISKSENTINEL FINAL MODEL EVALUATION")
-print("=" * 70)
+    "precision": round(
+        precision,
+        4,
+    ),
 
-print(f"\nTest samples: {len(y_test):,}")
+    "recall": round(
+        recall,
+        4,
+    ),
 
-print("\nClassification metrics")
-print("-" * 40)
+    "f1_score": round(
+        f1,
+        4,
+    ),
 
-print(f"Precision : {precision:.4f}")
-print(f"Recall    : {recall:.4f}")
-print(f"F1 Score  : {f1:.4f}")
-print(f"ROC-AUC   : {roc_auc:.4f}")
+    "roc_auc": round(
+        roc_auc,
+        4,
+    ),
+
+    "true_negatives": int(tn),
+    "false_positives": int(fp),
+    "false_negatives": int(fn),
+    "true_positives": int(tp),
+
+    "false_positive_cost": int(
+        false_positive_cost
+    ),
+
+    "false_negative_cost": int(
+        false_negative_cost
+    ),
+
+    "total_estimated_cost": int(
+        total_cost
+    ),
+}
+
+
+with open(
+    METRICS_PATH,
+    "w",
+    encoding="utf-8",
+) as f:
+    json.dump(
+        metrics,
+        f,
+        indent=4,
+    )
+
+
+# -----------------------------
+# Print final evaluation
+# -----------------------------
+print("\nFinal Model Evaluation")
+print("======================")
+
+print(
+    f"Threshold : {THRESHOLD:.2f}"
+)
+
+print(
+    f"Precision : {precision:.4f}"
+)
+
+print(
+    f"Recall    : {recall:.4f}"
+)
+
+print(
+    f"F1 Score  : {f1:.4f}"
+)
+
+print(
+    f"ROC-AUC   : {roc_auc:.4f}"
+)
 
 print("\nConfusion Matrix")
-print("-" * 40)
+print("----------------")
+print(
+    f"TN: {tn}"
+)
 
-print(f"True Negatives : {tn}")
-print(f"False Positives: {fp}")
-print(f"False Negatives: {fn}")
-print(f"True Positives : {tp}")
+print(
+    f"FP: {fp}"
+)
+
+print(
+    f"FN: {fn}"
+)
+
+print(
+    f"TP: {tp}"
+)
 
 print("\nBusiness Cost")
-print("-" * 40)
+print("-------------")
 
 print(
-    f"False-positive cost: Rs.{fp_cost:,.2f}"
+    f"False Positive Cost : ₹{false_positive_cost:,}"
 )
 
 print(
-    f"False-negative cost: Rs.{fn_cost:,.2f}"
+    f"False Negative Cost : ₹{false_negative_cost:,}"
 )
 
 print(
-    f"Total estimated cost: Rs.{total_cost:,.2f}"
+    f"Total Estimated Cost: ₹{total_cost:,}"
 )
 
-print("\nDetailed Classification Report")
-print("-" * 40)
-
 print(
-    classification_report(
-        y_test,
-        predictions,
-        digits=4
-    )
+    f"\nMetrics saved to: {METRICS_PATH}"
 )

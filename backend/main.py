@@ -15,10 +15,16 @@ from sqlalchemy.orm import Session
 from sqlalchemy import text
 
 from database import Base, engine, get_db
-from models import Transaction
-from schemas import TransactionRequest
+from models import Transaction, Customer
+from schemas import (
+    TransactionRequest,
+    NewTransactionRequest,
+    CustomerRequest
+)
 from services.risk_service import assess_risk
 from services.ai_investigator import investigate_transaction
+from services.report_service import get_model_metrics
+from services.customer_history import get_customer_history
 
 
 # Configure logging
@@ -324,4 +330,312 @@ def investigate_saved_transaction(
         "success": True,
         "transaction_id": transaction.id,
         "investigation": investigation
+    }
+
+# --------------------------------------------------
+# Model performance report
+# --------------------------------------------------
+
+@app.get(
+    "/api/v1/reports/model-performance"
+)
+def model_performance_report():
+
+    try:
+
+        metrics = get_model_metrics()
+
+        return {
+            "success": True,
+            "data": metrics
+        }
+
+    except FileNotFoundError as error:
+
+        raise HTTPException(
+            status_code=404,
+            detail=str(error)
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to load model metrics"
+        )
+
+# --------------------------------------------------
+# Customers
+# --------------------------------------------------
+
+@app.post("/api/v1/customers")
+def create_customer(
+    customer: CustomerRequest,
+    db: Session = Depends(get_db)
+):
+
+    existing_customer = (
+        db.query(Customer)
+        .filter(
+            Customer.customer_id ==
+            customer.customer_id
+        )
+        .first()
+    )
+
+    if existing_customer:
+        raise HTTPException(
+            status_code=409,
+            detail="Customer already exists"
+        )
+
+    new_customer = Customer(
+        customer_id=customer.customer_id,
+        name=customer.name,
+        email=customer.email,
+        account_age_days=customer.account_age_days
+    )
+
+    db.add(new_customer)
+    db.commit()
+    db.refresh(new_customer)
+
+    return {
+        "success": True,
+        "data": {
+            "id": new_customer.id,
+            "customer_id":
+                new_customer.customer_id,
+            "name": new_customer.name,
+            "email": new_customer.email,
+            "account_age_days":
+                new_customer.account_age_days
+        }
+    }
+
+
+# --------------------------------------------------
+# New Transaction with Customer Workflow
+# --------------------------------------------------
+
+@app.post("/api/v1/transactions/new")
+def create_new_transaction(
+    payload: NewTransactionRequest,
+    db: Session = Depends(get_db)
+):
+    try:
+        # -----------------------------------------
+        # Find or create customer
+        # -----------------------------------------
+
+        customer = (
+            db.query(Customer)
+            .filter(
+                Customer.customer_id ==
+                payload.customer.customer_id
+            )
+            .first()
+        )
+
+        if not customer:
+
+            customer = Customer(
+                customer_id=
+                    payload.customer.customer_id,
+
+                name=
+                    payload.customer.name,
+
+                email=
+                    payload.customer.email,
+
+                account_age_days=
+                    payload.customer.account_age_days
+            )
+
+            db.add(customer)
+            db.flush()
+            
+        # -----------------------------------------
+        # Get customer history
+        # -----------------------------------------
+        history = get_customer_history(customer.id, db)
+
+        # -----------------------------------------
+        # Prepare transaction data
+        # -----------------------------------------
+
+        transaction_data = {
+            "amount": payload.amount,
+
+            "account_age_days":
+                payload.customer.account_age_days,
+
+            "transactions_last_24h":
+                payload.transactions_last_24h,
+
+            "avg_transaction_amount":
+                payload.avg_transaction_amount,
+
+            "failed_attempts":
+                payload.failed_attempts,
+
+            "device_changed":
+                payload.device_changed,
+
+            "location_changed":
+                payload.location_changed,
+
+            "ip_risk_score":
+                payload.ip_risk_score,
+
+            "previous_chargebacks":
+                payload.previous_chargebacks,
+
+            "transaction_hour":
+                payload.transaction_hour,
+
+            "payment_method":
+                payload.payment_method
+        }
+
+        transaction_data.update(history)
+
+        # -----------------------------------------
+        # Run RiskSentinel
+        # -----------------------------------------
+
+        result = assess_risk(
+            transaction_data
+        )
+
+        # -----------------------------------------
+        # Save transaction
+        # -----------------------------------------
+
+        new_transaction = Transaction(
+            customer_id=customer.id,
+
+            amount=payload.amount,
+
+            account_age_days=
+                payload.customer.account_age_days,
+
+            transactions_last_24h=
+                payload.transactions_last_24h,
+
+            avg_transaction_amount=
+                payload.avg_transaction_amount,
+
+            failed_attempts=
+                payload.failed_attempts,
+
+            device_changed=
+                payload.device_changed,
+
+            location_changed=
+                payload.location_changed,
+
+            ip_risk_score=
+                payload.ip_risk_score,
+
+            previous_chargebacks=
+                payload.previous_chargebacks,
+
+            transaction_hour=
+                payload.transaction_hour,
+
+            payment_method=
+                payload.payment_method,
+
+            risk_score=
+                result["risk_score"],
+
+            risk_level=
+                result["risk_level"],
+
+            recommended_action=
+                result["recommended_action"],
+
+            risk_reasons=
+                "||".join(result["reasons"])
+        )
+
+        db.add(new_transaction)
+        db.commit()
+        db.refresh(new_transaction)
+
+        return {
+            "success": True,
+
+            "customer": {
+                "id": customer.id,
+                "customer_id":
+                    customer.customer_id,
+                "name":
+                    customer.name
+            },
+
+            "customer_history": history,
+
+            "transaction": {
+                "id": new_transaction.id,
+                "risk_score":
+                    new_transaction.risk_score,
+                "risk_level":
+                    new_transaction.risk_level,
+                "recommended_action":
+                    new_transaction.recommended_action,
+                "reasons":
+                    result["reasons"]
+            }
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to create transaction"
+        )
+
+@app.get(
+    "/api/v1/customers/{customer_id}"
+)
+def get_customer(
+    customer_id: str,
+    db: Session = Depends(get_db)
+):
+
+    customer = (
+        db.query(Customer)
+        .filter(
+            Customer.customer_id ==
+            customer_id
+        )
+        .first()
+    )
+
+    if not customer:
+        raise HTTPException(
+            status_code=404,
+            detail="Customer not found"
+        )
+
+    history = get_customer_history(
+        customer.id,
+        db
+    )
+
+    return {
+        "success": True,
+
+        "customer": {
+            "id": customer.id,
+            "customer_id": customer.customer_id,
+            "name": customer.name,
+            "email": customer.email,
+            "account_age_days":
+                customer.account_age_days,
+        },
+
+        "history": history,
     }

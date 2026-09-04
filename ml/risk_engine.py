@@ -1,259 +1,357 @@
 import os
 import joblib
-import pandas as pd
+import numpy as np
 
 
-# --------------------------------------------------
-# Load trained model
-# --------------------------------------------------
-
-MODEL_PATH = os.path.join(
-    os.path.dirname(__file__),
-    "saved_models",
-    "xgboost_risk_model.pkl"
+# -----------------------------
+# Load model
+# -----------------------------
+BASE_DIR = os.path.dirname(
+    os.path.dirname(__file__)
 )
 
-model = joblib.load(MODEL_PATH)
+MODEL_PATH = os.path.join(
+    BASE_DIR,
+    "ml",
+    "saved_models",
+    "xgboost_risk_model.pkl",
+)
+
+model_package = joblib.load(MODEL_PATH)
+
+model = model_package["model"]
+preprocessor = model_package["preprocessor"]
+feature_columns = model_package["features"]
 
 
-# --------------------------------------------------
-# Risk thresholds (data-driven from threshold_analysis.py)
-# Optimal cost threshold = 0.55, best F1 threshold = 0.65
-# Rs.500/FP and Rs.2000/FN assumptions
-# --------------------------------------------------
-
-HIGH_RISK_THRESHOLD = 80   # probability >= 0.80 -> HIGH
-MEDIUM_RISK_THRESHOLD = 55  # probability >= 0.55 -> MEDIUM, < 0.55 -> LOW
+# -----------------------------
+# Production threshold
+# -----------------------------
+THRESHOLD = 0.30
 
 
-# --------------------------------------------------
+# -----------------------------
 # Risk classification
-# --------------------------------------------------
-
-def classify_risk(risk_score: int) -> str:
+# -----------------------------
+def classify_risk(probability: float):
     """
-    Convert a 0-100 risk score into a risk level.
-    Thresholds selected via threshold_analysis.py
-    to minimize total business cost.
+    Convert fraud probability into application risk levels.
     """
 
-    if risk_score < MEDIUM_RISK_THRESHOLD:
-        return "LOW"
-
-    if risk_score < HIGH_RISK_THRESHOLD:
-        return "MEDIUM"
-
-    return "HIGH"
-
-
-# --------------------------------------------------
-# Recommended action
-# --------------------------------------------------
-
-def recommended_action(risk_level: str) -> str:
-    """
-    Decide what action should be taken.
-    """
-
-    if risk_level == "LOW":
-        return "ALLOW"
-
-    if risk_level == "MEDIUM":
-        return "MONITOR"
-
-    return "MANUAL_REVIEW"
-
-
-# --------------------------------------------------
-# Generate explanation
-# --------------------------------------------------
-
-def generate_reasons(transaction: dict) -> list[str]:
-    """
-    Generate simple rule-based explanations
-    for why a transaction may be risky.
-    """
-
-    reasons = []
-
-    amount = float(transaction["amount"])
-    avg_amount = float(
-        transaction["avg_transaction_amount"]
+    # Probability → 0–100 risk score
+    risk_score = round(
+        probability * 100,
+        2,
     )
 
-    amount_ratio = amount / (avg_amount + 1)
+    if probability < 0.30:
+        risk_level = "LOW"
+        recommended_action = "ALLOW"
+
+    elif probability < 0.70:
+        risk_level = "MEDIUM"
+        recommended_action = "MONITOR"
+
+    else:
+        risk_level = "HIGH"
+        recommended_action = "MANUAL_REVIEW"
+
+    return (
+        risk_score,
+        risk_level,
+        recommended_action,
+    )
+
+
+# -----------------------------
+# Build reasons
+# -----------------------------
+def generate_reasons(transaction: dict):
+    reasons = []
+
+    amount = transaction.get(
+        "amount",
+        0,
+    )
+
+    historical_average = transaction.get(
+        "historical_average_amount",
+        0,
+    )
+
+    amount_ratio = transaction.get(
+        "amount_vs_historical_average",
+        1,
+    )
 
     if amount_ratio > 5:
         reasons.append(
-            "Transaction amount is unusually high "
-            "compared with historical average"
+            "Transaction amount is significantly above the customer's historical average."
         )
 
-    if transaction["account_age_days"] < 30:
+    if transaction.get(
+        "device_changed",
+        0,
+    ):
         reasons.append(
-            "Customer account is very new"
+            "Transaction was made from a new device."
         )
 
-    if transaction["transactions_last_24h"] >= 8:
+    if transaction.get(
+        "location_changed",
+        0,
+    ):
         reasons.append(
-            "Unusually high transaction frequency"
+            "Transaction location differs from previous activity."
         )
 
-    if transaction["failed_attempts"] >= 3:
+    if transaction.get(
+        "failed_attempts",
+        0,
+    ) >= 3:
         reasons.append(
-            "Multiple failed payment attempts detected"
+            "Multiple failed payment attempts detected."
         )
 
-    if transaction["device_changed"] == 1:
+    if transaction.get(
+        "ip_risk_score",
+        0,
+    ) >= 0.50:
         reasons.append(
-            "New device detected"
+            "IP address has elevated risk signals."
         )
 
-    if transaction["location_changed"] == 1:
+    if transaction.get(
+        "previous_chargebacks",
+        0,
+    ) > 0:
         reasons.append(
-            "Unusual location change detected"
+            "Customer has previous chargeback activity."
         )
 
-    if transaction["ip_risk_score"] >= 0.6:
+    if transaction.get(
+        "previous_high_risk_count",
+        0,
+    ) >= 2:
         reasons.append(
-            "High-risk IP signal"
+            "Customer has multiple previous high-risk transactions."
         )
 
-    if transaction["previous_chargebacks"] >= 1:
+    if transaction.get(
+        "previous_blocked_count",
+        0,
+    ) > 0:
         reasons.append(
-            "Previous chargeback history detected"
+            "Customer has previously had a blocked transaction."
         )
 
-    if transaction["transaction_hour"] <= 4:
+    if transaction.get(
+        "transactions_last_1h",
+        0,
+    ) >= 3:
         reasons.append(
-            "Transaction occurred during unusual hours"
+            "Unusually high transaction velocity detected."
         )
 
     if not reasons:
         reasons.append(
-            "No major individual risk signals detected"
+            "No major risk indicators detected."
         )
 
     return reasons
 
 
-# --------------------------------------------------
-# Risk prediction
-# --------------------------------------------------
-
-def assess_transaction(transaction: dict) -> dict:
+# -----------------------------
+# Main risk assessment
+# -----------------------------
+def assess_transaction(transaction: dict):
     """
-    Assess one payment transaction.
+    Assess a transaction using the history-aware XGBoost model.
     """
 
-    # Convert input into DataFrame
-    transaction_df = pd.DataFrame([transaction])
-
-    # Get fraud probability
-    probability = model.predict_proba(
-        transaction_df
-    )[0][1]
-
-    # Convert probability to 0-100
-    risk_score = round(
-        float(probability) * 100
+    # -------------------------
+    # Safety defaults
+    # -------------------------
+    historical_average = transaction.get(
+        "historical_average_amount",
+        transaction.get(
+            "avg_transaction_amount",
+            0,
+        ),
     )
 
-    # Make sure score is within range
-    risk_score = max(
+    if historical_average <= 0:
+        historical_average = transaction.get(
+            "avg_transaction_amount",
+            1,
+        )
+
+    amount = transaction.get(
+        "amount",
         0,
-        min(100, risk_score)
     )
 
-    # Classify risk
-    risk_level = classify_risk(
-        risk_score
+    amount_ratio = amount / (
+        historical_average + 1
     )
 
-    # Decide action
-    action = recommended_action(
-        risk_level
+    # -------------------------
+    # Prepare model input
+    # -------------------------
+    model_input = {
+        "amount": amount,
+        "account_age_days": transaction.get(
+            "account_age_days",
+            0,
+        ),
+        "transactions_last_24h": transaction.get(
+            "transactions_last_24h",
+            0,
+        ),
+        "avg_transaction_amount": transaction.get(
+            "avg_transaction_amount",
+            historical_average,
+        ),
+        "failed_attempts": transaction.get(
+            "failed_attempts",
+            0,
+        ),
+        "device_changed": transaction.get(
+            "device_changed",
+            0,
+        ),
+        "location_changed": transaction.get(
+            "location_changed",
+            0,
+        ),
+        "ip_risk_score": transaction.get(
+            "ip_risk_score",
+            0,
+        ),
+        "previous_chargebacks": transaction.get(
+            "previous_chargebacks",
+            0,
+        ),
+        "transaction_hour": transaction.get(
+            "transaction_hour",
+            12,
+        ),
+        "payment_method": transaction.get(
+            "payment_method",
+            "UPI",
+        ),
+
+        # Customer history
+        "previous_transaction_count": transaction.get(
+            "previous_transaction_count",
+            0,
+        ),
+        "historical_average_amount": historical_average,
+        "amount_vs_historical_average": transaction.get(
+            "amount_vs_historical_average",
+            amount_ratio,
+        ),
+        "previous_high_risk_count": transaction.get(
+            "previous_high_risk_count",
+            0,
+        ),
+        "previous_blocked_count": transaction.get(
+            "previous_blocked_count",
+            0,
+        ),
+        "transactions_last_1h": transaction.get(
+            "transactions_last_1h",
+            0,
+        ),
+    }
+
+    # -------------------------
+    # Create DataFrame
+    # -------------------------
+    import pandas as pd
+
+    input_df = pd.DataFrame(
+        [model_input]
     )
 
-    # Generate reasons
+    # Make sure column order exactly matches training
+    input_df = input_df[
+        feature_columns
+    ]
+
+    # -------------------------
+    # Transform
+    # -------------------------
+    processed_input = (
+        preprocessor.transform(
+            input_df
+        )
+    )
+
+    # -------------------------
+    # Predict probability
+    # -------------------------
+    probability = float(
+        model.predict_proba(
+            processed_input
+        )[0][1]
+    )
+
+    # -------------------------
+    # Classification
+    # -------------------------
+    (
+        risk_score,
+        risk_level,
+        recommended_action,
+    ) = classify_risk(
+        probability
+    )
+
+    # -------------------------
+    # Reasons
+    # -------------------------
     reasons = generate_reasons(
-        transaction
+        model_input
     )
 
     return {
         "risk_score": risk_score,
+        "risk_probability": round(
+            probability,
+            4,
+        ),
         "risk_level": risk_level,
-        "recommended_action": action,
-        "reasons": reasons
+        "recommended_action": recommended_action,
+        "risk_reasons": reasons,
+        "model": "XGBoost",
+        "model_version": "history-aware-v1",
     }
-
-
-# --------------------------------------------------
-# Test transactions
-# --------------------------------------------------
-
-def print_assessment(label: str, transaction: dict):
-    result = assess_transaction(transaction)
-    print(f"\n{'=' * 60}")
-    print(f"  {label}")
-    print(f"{'=' * 60}")
-    print(f"  Risk Score : {result['risk_score']}/100")
-    print(f"  Risk Level : {result['risk_level']}")
-    print(f"  Action     : {result['recommended_action']}")
-    print(f"\n  Risk Reasons:")
-    for i, reason in enumerate(result["reasons"], start=1):
-        print(f"    {i}. {reason}")
 
 
 if __name__ == "__main__":
-
-    # --- HIGH RISK ---
-    high_risk = {
-        "amount": 18500,
-        "account_age_days": 3,
-        "transactions_last_24h": 10,
-        "avg_transaction_amount": 1200,
-        "failed_attempts": 4,
-        "device_changed": 1,
-        "location_changed": 1,
-        "ip_risk_score": 0.85,
-        "previous_chargebacks": 1,
-        "transaction_hour": 2,
-        "payment_method": "UPI"
-    }
-
-    # --- LOW RISK ---
-    low_risk = {
-        "amount": 650,
-        "account_age_days": 800,
-        "transactions_last_24h": 2,
-        "avg_transaction_amount": 700,
-        "failed_attempts": 0,
-        "device_changed": 0,
-        "location_changed": 0,
-        "ip_risk_score": 0.05,
-        "previous_chargebacks": 0,
-        "transaction_hour": 14,
-        "payment_method": "UPI"
-    }
-
-    # --- MEDIUM RISK ---
-    medium_risk = {
-        "amount": 4500,
+    test_transaction = {
+        "amount": 15000,
         "account_age_days": 120,
         "transactions_last_24h": 5,
-        "avg_transaction_amount": 1500,
-        "failed_attempts": 1,
-        "device_changed": 0,
+        "avg_transaction_amount": 800,
+        "failed_attempts": 2,
+        "device_changed": 1,
         "location_changed": 1,
-        "ip_risk_score": 0.35,
-        "previous_chargebacks": 0,
-        "transaction_hour": 20,
-        "payment_method": "CARD"
+        "ip_risk_score": 0.65,
+        "previous_chargebacks": 1,
+        "transaction_hour": 2,
+        "payment_method": "CARD",
+
+        "previous_transaction_count": 12,
+        "historical_average_amount": 850,
+        "amount_vs_historical_average": 17.63,
+        "previous_high_risk_count": 3,
+        "previous_blocked_count": 1,
+        "transactions_last_1h": 3,
     }
-
-    print("\nRISKSENTINEL TRANSACTION ASSESSMENTS")
-
-    print_assessment("TEST 1 — HIGH RISK TRANSACTION", high_risk)
-    print_assessment("TEST 2 — LOW RISK TRANSACTION", low_risk)
-    print_assessment("TEST 3 — MEDIUM RISK TRANSACTION", medium_risk)
+    
+    result = assess_transaction(test_transaction)
+    print("\nRisk Assessment Result:")
+    import json
+    print(json.dumps(result, indent=2))

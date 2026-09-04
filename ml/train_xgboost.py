@@ -1,70 +1,114 @@
 import os
 import joblib
 import pandas as pd
-import numpy as np
 
-from sklearn.model_selection import train_test_split
 from sklearn.compose import ColumnTransformer
-from sklearn.preprocessing import OneHotEncoder
-from sklearn.pipeline import Pipeline
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
-    roc_auc_score
+    precision_score,
+    recall_score,
+    f1_score,
+    roc_auc_score,
 )
-
+from sklearn.preprocessing import OneHotEncoder
 from xgboost import XGBClassifier
 
 
-# --------------------------------------------------
-# Paths
-# --------------------------------------------------
-
+# -----------------------------
+# Configuration
+# -----------------------------
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 
 DATA_PATH = os.path.join(
     BASE_DIR,
     "data",
-    "transactions.csv"
+    "transactions.csv",
 )
 
 MODEL_DIR = os.path.join(
-    os.path.dirname(__file__),
-    "saved_models"
+    BASE_DIR,
+    "ml",
+    "saved_models",
 )
 
-os.makedirs(MODEL_DIR, exist_ok=True)
+MODEL_PATH = os.path.join(
+    MODEL_DIR,
+    "xgboost_risk_model.pkl",
+)
 
 
-# --------------------------------------------------
+# -----------------------------
 # Load dataset
-# --------------------------------------------------
-
+# -----------------------------
 df = pd.read_csv(DATA_PATH)
 
-print(f"Dataset: {df.shape[0]:,} rows")
-print(f"Columns: {df.shape[1]}")
-
-
-# --------------------------------------------------
-# Features and target
-# --------------------------------------------------
-
-X = df.drop(
-    columns=["transaction_id", "fraud_label"]
+# Make sure timestamp is parsed
+df["timestamp"] = pd.to_datetime(
+    df["timestamp"]
 )
 
-y = df["fraud_label"]
+# Sort chronologically
+df = df.sort_values(
+    "timestamp"
+).reset_index(drop=True)
 
 
-# --------------------------------------------------
-# Feature types
-# --------------------------------------------------
+# -----------------------------
+# Features
+# -----------------------------
+feature_columns = [
+    "amount",
+    "account_age_days",
+    "transactions_last_24h",
+    "avg_transaction_amount",
+    "failed_attempts",
+    "device_changed",
+    "location_changed",
+    "ip_risk_score",
+    "previous_chargebacks",
+    "transaction_hour",
+    "payment_method",
 
-categorical_features = [
-    "payment_method"
+    # Customer history features
+    "previous_transaction_count",
+    "historical_average_amount",
+    "amount_vs_historical_average",
+    "previous_high_risk_count",
+    "previous_blocked_count",
+    "transactions_last_1h",
 ]
 
+target_column = "fraud_label"
+
+
+X = df[feature_columns]
+y = df[target_column]
+
+
+# -----------------------------
+# Chronological train/test split
+# -----------------------------
+split_index = int(len(df) * 0.80)
+
+X_train = X.iloc[:split_index]
+X_test = X.iloc[split_index:]
+
+y_train = y.iloc[:split_index]
+y_test = y.iloc[split_index:]
+
+
+print("\nDataset information")
+print("-------------------")
+print(f"Total samples : {len(df):,}")
+print(f"Training      : {len(X_train):,}")
+print(f"Testing       : {len(X_test):,}")
+print(f"Features      : {len(feature_columns)}")
+
+
+# -----------------------------
+# Preprocessing
+# -----------------------------
 numeric_features = [
     "amount",
     "account_age_days",
@@ -75,157 +119,203 @@ numeric_features = [
     "location_changed",
     "ip_risk_score",
     "previous_chargebacks",
-    "transaction_hour"
+    "transaction_hour",
+
+    "previous_transaction_count",
+    "historical_average_amount",
+    "amount_vs_historical_average",
+    "previous_high_risk_count",
+    "previous_blocked_count",
+    "transactions_last_1h",
 ]
 
+categorical_features = [
+    "payment_method"
+]
 
-# --------------------------------------------------
-# Preprocessing
-# --------------------------------------------------
 
 preprocessor = ColumnTransformer(
     transformers=[
         (
-            "categorical",
-            OneHotEncoder(handle_unknown="ignore"),
-            categorical_features
-        )
-    ],
-    remainder="passthrough"
-)
-
-
-# --------------------------------------------------
-# Train / Val / Test split (70 / 15 / 15)
-# --------------------------------------------------
-
-X_train_full, X_test, y_train_full, y_test = train_test_split(
-    X, y,
-    test_size=0.15,
-    random_state=42,
-    stratify=y
-)
-
-X_train, X_val, y_train, y_val = train_test_split(
-    X_train_full, y_train_full,
-    test_size=0.176,  # 0.176 of 85% ~ 15% of total
-    random_state=42,
-    stratify=y_train_full
-)
-
-print(f"\nTrain : {len(X_train):,}")
-print(f"Val   : {len(X_val):,}")
-print(f"Test  : {len(X_test):,}")
-
-# Calculate class imbalance ratio for scale_pos_weight
-neg_count = (y_train == 0).sum()
-pos_count = (y_train == 1).sum()
-scale_ratio = neg_count / pos_count
-
-print(f"\nClass ratio (neg/pos): {scale_ratio:.2f}")
-print(f"  Legit: {neg_count:,}  |  Fraud: {pos_count:,}")
-
-
-# --------------------------------------------------
-# Optimized XGBoost model
-# --------------------------------------------------
-
-model = XGBClassifier(
-    n_estimators=500,
-    max_depth=5,
-    learning_rate=0.05,
-    subsample=0.8,
-    colsample_bytree=0.8,
-    min_child_weight=3,
-    gamma=0.1,
-    reg_alpha=0.1,
-    reg_lambda=1.0,
-    scale_pos_weight=scale_ratio,   # Handle class imbalance
-    objective="binary:logistic",
-    eval_metric="auc",
-    early_stopping_rounds=30,
-    random_state=42,
-    n_jobs=-1
-)
-
-
-# --------------------------------------------------
-# Pipeline
-# --------------------------------------------------
-
-pipeline = Pipeline(
-    steps=[
-        ("preprocessor", preprocessor),
-        ("model", model)
+            "num",
+            "passthrough",
+            numeric_features,
+        ),
+        (
+            "cat",
+            OneHotEncoder(
+                handle_unknown="ignore"
+            ),
+            categorical_features,
+        ),
     ]
 )
 
 
-# --------------------------------------------------
-# Train with early stopping on validation set
-# --------------------------------------------------
-
-print("\nTraining optimized XGBoost...")
-
-# Pre-transform validation data for eval_set
-X_val_transformed = preprocessor.fit_transform(X_train)  # fit on train
-X_val_transformed = preprocessor.transform(X_val)
-
-pipeline.fit(
-    X_train,
-    y_train,
-    model__eval_set=[(X_val_transformed, y_val)],
-    model__verbose=False
+# -----------------------------
+# Transform data
+# -----------------------------
+X_train_processed = preprocessor.fit_transform(
+    X_train
 )
 
-best_iteration = pipeline.named_steps["model"].best_iteration
-print(f"Training completed. Best iteration: {best_iteration}")
+X_test_processed = preprocessor.transform(
+    X_test
+)
 
 
-# --------------------------------------------------
-# Evaluate on TEST set
-# --------------------------------------------------
+# -----------------------------
+# XGBoost model
+# -----------------------------
+model = XGBClassifier(
+    n_estimators=300,
+    max_depth=6,
+    learning_rate=0.05,
+    subsample=0.85,
+    colsample_bytree=0.85,
+    objective="binary:logistic",
+    eval_metric="logloss",
+    random_state=42,
+    n_jobs=-1,
+)
 
-y_pred = pipeline.predict(X_test)
-y_probability = pipeline.predict_proba(X_test)[:, 1]
+
+print("\nTraining XGBoost...")
+print("-------------------")
+
+model.fit(
+    X_train_processed,
+    y_train,
+)
 
 
-print("\n" + "=" * 60)
-print("OPTIMIZED XGBOOST — TEST SET RESULTS")
-print("=" * 60)
+# -----------------------------
+# Predictions
+# -----------------------------
+y_pred = model.predict(
+    X_test_processed
+)
 
+y_probability = model.predict_proba(
+    X_test_processed
+)[:, 1]
+
+
+# -----------------------------
+# Metrics
+# -----------------------------
+precision = precision_score(
+    y_test,
+    y_pred,
+    zero_division=0,
+)
+
+recall = recall_score(
+    y_test,
+    y_pred,
+    zero_division=0,
+)
+
+f1 = f1_score(
+    y_test,
+    y_pred,
+    zero_division=0,
+)
+
+roc_auc = roc_auc_score(
+    y_test,
+    y_probability,
+)
+
+cm = confusion_matrix(
+    y_test,
+    y_pred,
+)
+
+tn, fp, fn, tp = cm.ravel()
+
+
+# -----------------------------
+# Print results
+# -----------------------------
+print("\nModel Performance")
+print("-----------------")
+print(f"Precision : {precision:.4f}")
+print(f"Recall    : {recall:.4f}")
+print(f"F1 Score  : {f1:.4f}")
+print(f"ROC-AUC   : {roc_auc:.4f}")
+
+print("\nConfusion Matrix")
+print("----------------")
+print(cm)
+
+print("\nDetailed Classification Report")
+print("--------------------------------")
 print(
     classification_report(
-        y_test, y_pred, digits=4
+        y_test,
+        y_pred,
+        digits=4,
+        zero_division=0,
     )
 )
 
 
-print("=" * 60)
-print("CONFUSION MATRIX")
-print("=" * 60)
-
-cm = confusion_matrix(y_test, y_pred)
-print(cm)
-
-tn, fp, fn, tp = cm.ravel()
-print(f"\n  TN={tn}  FP={fp}")
-print(f"  FN={fn}  TP={tp}")
-
-
-auc = roc_auc_score(y_test, y_probability)
-print(f"\nROC-AUC: {auc:.4f}")
-
-
-# --------------------------------------------------
-# Save model
-# --------------------------------------------------
-
-MODEL_PATH = os.path.join(
-    MODEL_DIR,
-    "xgboost_risk_model.pkl"
+# -----------------------------
+# Feature importance
+# -----------------------------
+feature_names = (
+    numeric_features
+    + list(
+        preprocessor
+        .named_transformers_["cat"]
+        .get_feature_names_out(
+            categorical_features
+        )
+    )
 )
 
-joblib.dump(pipeline, MODEL_PATH)
+importance = pd.DataFrame(
+    {
+        "feature": feature_names,
+        "importance": model.feature_importances_,
+    }
+).sort_values(
+    "importance",
+    ascending=False,
+)
 
-print(f"\nModel saved: {MODEL_PATH}")
+print("\nTop 15 Important Features")
+print("-------------------------")
+print(
+    importance.head(15).to_string(
+        index=False
+    )
+)
+
+
+# -----------------------------
+# Save model + preprocessor
+# -----------------------------
+os.makedirs(
+    MODEL_DIR,
+    exist_ok=True,
+)
+
+model_package = {
+    "model": model,
+    "preprocessor": preprocessor,
+    "features": feature_columns,
+    "numeric_features": numeric_features,
+    "categorical_features": categorical_features,
+}
+
+joblib.dump(
+    model_package,
+    MODEL_PATH,
+)
+
+
+print(
+    f"\nModel saved to: {MODEL_PATH}"
+)
